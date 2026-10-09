@@ -1,0 +1,616 @@
+// Сквозная аналитика AZ GROUP — схема базы (ТЗ, разделы 1–4).
+// Таблицы и колонки в snake_case: метрики считаются SQL-представлениями (раздел 9),
+// и писать их удобнее по тем же именам, что в ТЗ.
+// Деньги — в тенге, Decimal(14, 2). Даты событий — без времени (часовой пояс Астаны, UTC+5).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Перечисления ─────────────────────────────
+
+/// Шаблон воронки до заявки (раздел 5)
+enum FunnelType {
+  paid // Показы → Клики → Чаты → Квалифицированные лиды
+  b2b // Школы в работе → Согласились → Активированы → Охват детей → Лиды
+  own // Контакты в базе → Отправлено / охвачено → Лиды
+}
+
+enum ChannelStatus {
+  active // активен
+  paused // пауза
+  not_launched // не запущен
+}
+
+enum TagType {
+  video // ролик
+  school // школа
+  promoter // промоутер
+  link // ссылка
+  event // мероприятие
+  mailing // рассылка по базе
+}
+
+enum EventType {
+  main // основная
+  school_based // на базе школы
+  final // финал
+}
+
+/// Статус школы в B2B-воронке
+enum SchoolB2bStatus {
+  not_contacted // ещё не в работе
+  in_progress // в работе
+  agreed // согласились
+  activated // активированы: проведена рассылка, промо или квиз
+  declined // отказались
+}
+
+/// Источник поступления заявки
+enum LeadSource {
+  form // Google Форма
+  whatsapp
+  call // звонок
+  event // мероприятие, выставка
+  import // импорт базы прошлого сезона
+}
+
+enum LeadStatus {
+  new // новый
+  qualified // квалифицирован
+  registered // зарегистрирован
+  paid // оплатил
+  rejected // отказ
+}
+
+enum PaymentMethod {
+  kaspi_remote // Kaspi, удалённая оплата
+  other
+}
+
+enum PaymentStatus {
+  paid // оплачено
+  refunded // возврат
+}
+
+enum PurchaseType {
+  first // первая покупка семьи
+  repeat // повторная
+}
+
+/// Статья расхода
+enum ExpenseCategory {
+  ads // реклама
+  promoters // промоутеры
+  print // печать
+  cashback // кэшбек (ручной; автоматический кэшбек по школам считается в представлениях)
+  prizes // призы
+  event // мероприятие
+  other // другое
+}
+
+enum B2bActivityType {
+  mailing // рассылка
+  promo // промо
+  quiz // квиз
+  school_olympiad // олимпиада в школе
+}
+
+enum UserRole {
+  admin // всё
+  manager // этап 2: лиды и сопоставление платежей
+  viewer // руководство: дашборд без персональных данных
+}
+
+enum ImportType {
+  form_responses // ответы Google Формы (CSV)
+  payment_marks // отметки оплаты из Google Таблицы
+  meta_ads // статистика Meta Ads Manager
+  olympiad_results // итоги олимпиады
+  past_season // база прошлого сезона
+}
+
+// ───────────────────────────── Справочники ─────────────────────────────
+
+model ChannelGroup {
+  id         Int        @id @default(autoincrement())
+  code       String     @unique // A–F
+  name       String
+  funnelType FunnelType @map("funnel_type")
+  sortOrder  Int        @default(0) @map("sort_order")
+  channels   Channel[]
+  createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+
+  @@map("channel_groups")
+}
+
+model Channel {
+  id                 Int           @id @default(autoincrement())
+  code               String        @unique // TARGET_META, ZAVUCH, PROMO…
+  name               String
+  groupId            Int?          @map("group_id") // null только у служебного UNKNOWN
+  group              ChannelGroup? @relation(fields: [groupId], references: [id])
+  status             ChannelStatus @default(not_launched)
+  /// Переопределяет шаблон воронки группы: в группе B промо и квизы — b2b, а выставки и мероприятия — own
+  funnelTypeOverride FunnelType?   @map("funnel_type_override")
+  owner              String? // ответственный
+  /// «Как считаем» из карты каналов
+  attributionNote    String?       @map("attribution_note")
+  isSystem           Boolean       @default(false) @map("is_system") // UNKNOWN: не показывать в генераторе ссылок
+  sortOrder          Int           @default(0) @map("sort_order")
+
+  tags               Tag[]
+  plans              Plan[]
+  sourceAnswers      SourceAnswer[]
+  firstTouchFamilies Family[]       @relation("FamilyFirstTouchChannel")
+  leads              Lead[]         @relation("LeadChannel")
+  answerLeads        Lead[]         @relation("LeadAnswerChannel")
+  expenses           Expense[]
+  b2bActivities      B2bActivity[]
+  reachStats         ReachStat[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("channels")
+}
+
+model Tag {
+  id          Int       @id @default(autoincrement())
+  code        String    @unique // FB-1, PROMO-AIDAR, SCH-ZERDELI
+  channelId   Int       @map("channel_id")
+  channel     Channel   @relation(fields: [channelId], references: [id])
+  type        TagType
+  description String?
+  /// Для меток типа «школа»: какая школа
+  schoolId    Int?      @map("school_id")
+  school      School?   @relation(fields: [schoolId], references: [id])
+  activeFrom  DateTime? @map("active_from") @db.Date
+  activeTo    DateTime? @map("active_to") @db.Date
+
+  firstTouchFamilies Family[]    @relation("FamilyFirstTouchTag")
+  leads              Lead[]
+  expenses           Expense[]
+  adStats            AdStat[]
+  reachStats         ReachStat[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([channelId])
+  @@map("tags")
+}
+
+/// Варианты ответа «Откуда узнали» в форме и канал, который им соответствует (правило 2, раздел 4)
+model SourceAnswer {
+  id        Int      @id @default(autoincrement())
+  label     String   @unique // текст ответа, как в Google Форме
+  channelId Int?     @map("channel_id") // null — «Другое», канал не определяется
+  channel   Channel? @relation(fields: [channelId], references: [id])
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("source_answers")
+}
+
+model Olympiad {
+  id           Int      @id @default(autoincrement())
+  code         String   @unique // FIBONACCI, ATLANTIA
+  name         String
+  defaultPrice Decimal  @map("default_price") @db.Decimal(14, 2)
+  /// Доля AZ GROUP с выручки, %. null — не задана, ROMI считается по выручке
+  azSharePct   Decimal? @map("az_share_pct") @db.Decimal(5, 2)
+  seasonPlan   Int      @map("season_plan") // план участий на сезон
+
+  events Event[]
+  plans  Plan[]
+  leads  Lead[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("olympiads")
+}
+
+model Event {
+  id            Int       @id @default(autoincrement())
+  olympiadId    Int       @map("olympiad_id")
+  olympiad      Olympiad  @relation(fields: [olympiadId], references: [id])
+  date          DateTime? @db.Date // у финала дата может быть ещё не известна
+  city          String    @default("Астана")
+  subject       String? // предмет — для Atlantia
+  type          EventType @default(main)
+  venueSchoolId Int?      @map("venue_school_id") // школа-площадка
+  venueSchool   School?   @relation(fields: [venueSchoolId], references: [id])
+
+  plans          Plan[]
+  registrations  Registration[]
+  participations Participation[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([olympiadId, date])
+  @@map("events")
+}
+
+model School {
+  id             Int             @id @default(autoincrement())
+  name           String
+  city           String          @default("Астана")
+  district       String?
+  isPartner      Boolean         @default(false) @map("is_partner")
+  zavuchContact  String?         @map("zavuch_contact")
+  /// Особая цена участия (например, 20 000 ₸ для Zerdeli). null — цена олимпиады
+  specialPrice   Decimal?        @map("special_price") @db.Decimal(14, 2)
+  /// Кэшбек за оплаченное участие. null — значение из настроек
+  cashbackAmount Decimal?        @map("cashback_amount") @db.Decimal(14, 2)
+  b2bStatus      SchoolB2bStatus @default(not_contacted) @map("b2b_status")
+
+  tags          Tag[]
+  events        Event[]
+  children      Child[]
+  b2bActivities B2bActivity[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([name, city])
+  @@map("schools")
+}
+
+/// План по каналу и/или олимпиаде/дате на период. Пустой канал — план по олимпиаде в целом
+model Plan {
+  id                    Int       @id @default(autoincrement())
+  channelId             Int?      @map("channel_id")
+  channel               Channel?  @relation(fields: [channelId], references: [id])
+  olympiadId            Int?      @map("olympiad_id")
+  olympiad              Olympiad? @relation(fields: [olympiadId], references: [id])
+  eventId               Int?      @map("event_id")
+  event                 Event?    @relation(fields: [eventId], references: [id])
+  periodFrom            DateTime  @map("period_from") @db.Date
+  periodTo              DateTime  @map("period_to") @db.Date
+  plannedParticipations Int       @map("planned_participations")
+  plannedSpend          Decimal?  @map("planned_spend") @db.Decimal(14, 2)
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  @@map("plans")
+}
+
+// ───────────────────────────── Клиенты и продажи ─────────────────────────────
+
+model Family {
+  id                  Int       @id @default(autoincrement())
+  phone               String    @unique // нормализованный: +77XXXXXXXXX
+  parentName          String?   @map("parent_name")
+  email               String?
+  /// Канал первого касания: записывается с первой заявкой и больше не меняется (раздел 4)
+  firstTouchChannelId Int?      @map("first_touch_channel_id")
+  firstTouchChannel   Channel?  @relation("FamilyFirstTouchChannel", fields: [firstTouchChannelId], references: [id])
+  firstTouchTagId     Int?      @map("first_touch_tag_id")
+  firstTouchTag       Tag?      @relation("FamilyFirstTouchTag", fields: [firstTouchTagId], references: [id])
+  firstTouchAt        DateTime? @map("first_touch_at")
+
+  children Child[]
+  leads    Lead[]
+  payments Payment[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([firstTouchChannelId])
+  @@map("families")
+}
+
+/// Ребёнок. Хранится минимум (раздел 8): имя, класс, школа. Фамилия, дата рождения и адрес не хранятся
+model Child {
+  id           Int     @id @default(autoincrement())
+  familyId     Int     @map("family_id")
+  family       Family  @relation(fields: [familyId], references: [id])
+  /// HMAC-SHA256(ИИН, IIN_HMAC_SECRET) в hex. Открытый ИИН не хранится нигде
+  iinHash      String? @unique @map("iin_hash")
+  firstName    String  @map("first_name")
+  grade        Int? // класс
+  schoolId     Int?    @map("school_id")
+  school       School? @relation(fields: [schoolId], references: [id])
+  /// Школа текстом, если её нет в справочнике
+  schoolName   String? @map("school_name")
+  language     String? // язык обучения
+  teacherPhone String? @map("teacher_phone")
+
+  registrations  Registration[]
+  participations Participation[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([familyId])
+  @@map("children")
+}
+
+model Lead {
+  id              Int        @id @default(autoincrement())
+  familyId        Int        @map("family_id")
+  family          Family     @relation(fields: [familyId], references: [id])
+  olympiadId      Int?       @map("olympiad_id") // олимпиада интереса
+  olympiad        Olympiad?  @relation(fields: [olympiadId], references: [id])
+  source          LeadSource
+  /// Код метки, как пришёл (из ссылки, сообщения WhatsApp, ручного ввода)
+  rawTagCode      String?    @map("raw_tag_code")
+  tagId           Int?       @map("tag_id") // метка, найденная по коду
+  tag             Tag?       @relation(fields: [tagId], references: [id])
+  /// «Откуда узнали» со слов родителя
+  howHeard        String?    @map("how_heard")
+  /// Канал по ответу «Откуда узнали» — нужен для проверки противоречий
+  answerChannelId Int?       @map("answer_channel_id")
+  answerChannel   Channel?   @relation("LeadAnswerChannel", fields: [answerChannelId], references: [id])
+  /// Итоговый канал по правилу из раздела 4
+  channelId       Int        @map("channel_id")
+  channel         Channel    @relation("LeadChannel", fields: [channelId], references: [id])
+  /// Код и ответ противоречат друг другу — «на проверку»
+  needsReview     Boolean    @default(false) @map("needs_review")
+  status          LeadStatus @default(new)
+  rejectReason    String?    @map("reject_reason")
+  leadAt          DateTime   @default(now()) @map("lead_at")
+  /// Первое сообщение клиента (быстрый ввод из WhatsApp)
+  rawMessage      String?    @map("raw_message")
+
+  registrations Registration[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([familyId])
+  @@index([channelId, leadAt])
+  @@index([status])
+  @@map("leads")
+}
+
+model Registration {
+  id             Int       @id @default(autoincrement())
+  childId        Int       @map("child_id")
+  child          Child     @relation(fields: [childId], references: [id])
+  eventId        Int       @map("event_id") // олимпиада + дата + предмет
+  event          Event     @relation(fields: [eventId], references: [id])
+  leadId         Int?      @map("lead_id")
+  lead           Lead?     @relation(fields: [leadId], references: [id])
+  registeredAt   DateTime  @default(now()) @map("registered_at")
+  /// ID ответа Google Формы — защита от повторной загрузки
+  formResponseId String?   @unique @map("form_response_id")
+  /// Когда родитель дал согласие на обработку данных. Без согласия запись не импортируется
+  consentAt      DateTime? @map("consent_at")
+
+  participation Participation?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([childId, eventId])
+  @@index([leadId])
+  @@map("registrations")
+}
+
+/// Платёж. Один платёж может покрывать несколько участий (несколько предметов за раз)
+model Payment {
+  id         Int           @id @default(autoincrement())
+  familyId   Int?          @map("family_id")
+  family     Family?       @relation(fields: [familyId], references: [id])
+  amount     Decimal       @db.Decimal(14, 2)
+  paidAt     DateTime      @map("paid_at") @db.Date
+  method     PaymentMethod @default(kaspi_remote)
+  payerPhone String?       @map("payer_phone")
+  markedById Int?          @map("marked_by_id") // кто отметил оплату
+  markedBy   User?         @relation(fields: [markedById], references: [id])
+  status     PaymentStatus @default(paid)
+  comment    String?
+
+  participations Participation[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([paidAt])
+  @@map("payments")
+}
+
+/// Основная единица учёта: одна оплаченная олимпиада, дата или предмет одного ребёнка
+model Participation {
+  id             Int           @id @default(autoincrement())
+  childId        Int           @map("child_id")
+  child          Child         @relation(fields: [childId], references: [id])
+  eventId        Int           @map("event_id")
+  event          Event         @relation(fields: [eventId], references: [id])
+  registrationId Int?          @unique @map("registration_id")
+  registration   Registration? @relation(fields: [registrationId], references: [id])
+  paymentId      Int           @map("payment_id")
+  payment        Payment       @relation(fields: [paymentId], references: [id])
+  actualPrice    Decimal       @map("actual_price") @db.Decimal(14, 2)
+  attended       Boolean? // null — итоги ещё не загружены
+  scorePct       Decimal?      @map("score_pct") @db.Decimal(5, 2)
+  /// Ставится автоматически при балле больше 50%
+  isFinalist     Boolean?      @map("is_finalist")
+  purchaseType   PurchaseType  @map("purchase_type")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([childId, eventId])
+  @@index([paymentId])
+  @@map("participations")
+}
+
+// ───────────────────────────── Расходы и платный трафик ─────────────────────────────
+
+model Expense {
+  id         Int             @id @default(autoincrement())
+  channelId  Int             @map("channel_id")
+  channel    Channel         @relation(fields: [channelId], references: [id])
+  tagId      Int?            @map("tag_id")
+  tag        Tag?            @relation(fields: [tagId], references: [id])
+  category   ExpenseCategory
+  amount     Decimal         @db.Decimal(14, 2)
+  periodFrom DateTime        @map("period_from") @db.Date
+  periodTo   DateTime        @map("period_to") @db.Date
+  comment    String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([channelId, periodFrom])
+  @@map("expenses")
+}
+
+/// Статистика ролика по дням. В MVP — импорт CSV из Meta Ads Manager
+model AdStat {
+  id            Int          @id @default(autoincrement())
+  tagId         Int          @map("tag_id")
+  tag           Tag          @relation(fields: [tagId], references: [id])
+  date          DateTime     @db.Date
+  adName        String?      @map("ad_name") // название объявления, как в выгрузке
+  impressions   Int          @default(0)
+  clicks        Int          @default(0)
+  chatsStarted  Int          @default(0) @map("chats_started")
+  spend         Decimal      @default(0) @db.Decimal(14, 2)
+  importBatchId Int?         @map("import_batch_id")
+  importBatch   ImportBatch? @relation(fields: [importBatchId], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([tagId, date])
+  @@map("ad_stats")
+}
+
+model B2bActivity {
+  id               Int             @id @default(autoincrement())
+  schoolId         Int             @map("school_id")
+  school           School          @relation(fields: [schoolId], references: [id])
+  channelId        Int             @map("channel_id")
+  channel          Channel         @relation(fields: [channelId], references: [id])
+  type             B2bActivityType
+  date             DateTime        @db.Date
+  reachClasses     Int?            @map("reach_classes")
+  reachChildren    Int?            @map("reach_children")
+  reachParentChats Int?            @map("reach_parent_chats")
+  comment          String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([schoolId, date])
+  @@map("b2b_activity")
+}
+
+/// Ручной ввод охвата для воронки own: контакты в базе → отправлено / охвачено (раздел 5)
+model ReachStat {
+  id        Int      @id @default(autoincrement())
+  channelId Int      @map("channel_id")
+  channel   Channel  @relation(fields: [channelId], references: [id])
+  tagId     Int?     @map("tag_id")
+  tag       Tag?     @relation(fields: [tagId], references: [id])
+  date      DateTime @db.Date
+  contacts  Int? // контактов в базе / подписчиков
+  reached   Int? // отправлено / охвачено
+  comment   String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([channelId, date])
+  @@map("reach_stats")
+}
+
+// ───────────────────────────── Система ─────────────────────────────
+
+/// Настройки — одна строка с id = 1
+model Setting {
+  id                     Int      @id @default(1)
+  targetCps              Decimal  @default(5000) @map("target_cps") @db.Decimal(14, 2)
+  cashbackPerParticipant Decimal  @default(5000) @map("cashback_per_participant") @db.Decimal(14, 2)
+  /// «Выключить»: потрачено больше N целевых CPS и нет оплат
+  hintOffCpsMultiplier   Decimal  @default(2) @map("hint_off_cps_multiplier") @db.Decimal(6, 2)
+  /// «Масштабировать»: CPS ниже целевого и оплат больше N
+  hintScaleMinPayments   Int      @default(5) @map("hint_scale_min_payments")
+  /// План по темпу ниже этого % — жёлтый
+  planWarnPct            Decimal  @default(70) @map("plan_warn_pct") @db.Decimal(5, 2)
+  /// Доля заявок без источника выше этого % — система меток не работает
+  unknownWarnPct         Decimal  @default(10) @map("unknown_warn_pct") @db.Decimal(5, 2)
+  /// «Зарегистрировались, но не оплатили больше N дней»
+  unpaidReminderDays     Int      @default(2) @map("unpaid_reminder_days")
+  /// Порог финалиста, % баллов (строго больше)
+  finalistThresholdPct   Decimal  @default(50) @map("finalist_threshold_pct") @db.Decimal(5, 2)
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+/// Вход по email и паролю + 2FA (TOTP). Публичной регистрации нет
+model User {
+  id           Int       @id @default(autoincrement())
+  email        String    @unique
+  name         String?
+  passwordHash String    @map("password_hash")
+  totpSecret   String?   @map("totp_secret") // хранить зашифрованным
+  totpEnabled  Boolean   @default(false) @map("totp_enabled")
+  role         UserRole  @default(admin)
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  payments      Payment[]
+  auditLogs     AuditLog[]
+  importBatches ImportBatch[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+/// Каждый импорт: предпросмотр (новые / дубли / ошибки) и итог
+model ImportBatch {
+  id          Int        @id @default(autoincrement())
+  type        ImportType
+  fileName    String?    @map("file_name")
+  userId      Int?       @map("user_id")
+  user        User?      @relation(fields: [userId], references: [id])
+  rowsTotal   Int        @default(0) @map("rows_total")
+  rowsNew     Int        @default(0) @map("rows_new")
+  rowsDup     Int        @default(0) @map("rows_dup")
+  rowsError   Int        @default(0) @map("rows_error")
+  committedAt DateTime?  @map("committed_at") // null — только предпросмотр
+  errors      Json? // строки с ошибками, без ИИН
+
+  adStats AdStat[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("import_batches")
+}
+
+/// Журнал действий: входы, импорты, выгрузки, ручные правки. ИИН сюда не пишется
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  userId    Int?     @map("user_id")
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String // login, import, export, create, update, delete
+  entity    String? // имя таблицы
+  entityId  String?  @map("entity_id")
+  changes   Json? // { поле: [было, стало] }
+  ip        String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([createdAt])
+  @@index([entity, entityId])
+  @@map("audit_log")
+}
